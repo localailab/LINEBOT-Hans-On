@@ -3,7 +3,7 @@ import json
 import base64
 import logging
 import traceback
-from datetime import datetime
+from datetime import datetime, timezone, timedelta
 
 import boto3
 from openai import OpenAI, OpenAIError
@@ -17,14 +17,17 @@ CHANNEL_SECRET = os.environ['LINE_CHANNEL_SECRET']
 OPENAI_API_KEY = os.environ['OPENAI_API_KEY']
 TENANT_ID = 0
 
+# ---------- タイムゾーン設定 ----------
+JST = timezone(timedelta(hours=9))
+
 # ---------- 外部サービス ----------
 # デフォルトで 15 秒タイムアウトを設定
 client = OpenAI(api_key=OPENAI_API_KEY, timeout=15.0)
 line_bot_api = LineBotApi(CHANNEL_ACCESS_TOKEN)
 handler = WebhookHandler(CHANNEL_SECRET)
 dynamodb = boto3.resource('dynamodb')
-chat_log_tb = dynamodb.Table('chat_log')
-user_info_tb = dynamodb.Table('user_info')
+chat_history_tb = dynamodb.Table('chat_history')
+user_details_tb = dynamodb.Table('user_details')
 
 # ---------- ロギング ----------
 logger = logging.getLogger()
@@ -41,6 +44,10 @@ def load_character_prompt():
         return "あなたは親切で賢いAIアシスタントです。"
 
 # ---------- ユーティリティ ----------
+
+def get_jst_now():
+    """現在の日本時間を取得"""
+    return datetime.now(JST)
 
 def send_safe_reply(reply_token: str, text: str):
     """LINE の reply API を安全に呼び、例外を握りつぶさずログに残す"""
@@ -90,7 +97,7 @@ def lambda_handler(event, context):
 
 @handler.add(MessageEvent, message=TextMessage)
 def handle_message(event):
-    start_ts = datetime.utcnow()
+    start_ts = get_jst_now()
     
     # ソース情報を取得
     user_id = event.source.user_id
@@ -111,7 +118,7 @@ def handle_message(event):
         user_message, user_name = preprocess_message(event)
         
         # ユーザー情報を保存
-        save_user_info(user_id, user_name)
+        save_user_details(user_id, user_name)
 
         # 会話IDを決定（グループ/ルームの場合はそのID、個人の場合はユーザーID）
         conversation_id = group_id or room_id or user_id
@@ -157,7 +164,7 @@ def handle_message(event):
         short_fallback(event)
 
     finally:
-        elapsed = (datetime.utcnow() - start_ts).total_seconds()
+        elapsed = (get_jst_now() - start_ts).total_seconds()
         logger.info({"action": "finished", "elapsed_sec": elapsed})
 
 # ---------- 前処理 ----------
@@ -206,10 +213,10 @@ def get_openai_response(user_message, history):
 
 # ---------- DynamoDB 操作 ----------
 
-def save_user_info(user_id, user_name):
-    now = datetime.utcnow().isoformat()
+def save_user_details(user_id, user_name):
+    now = get_jst_now().isoformat()
     try:
-        user_info_tb.put_item(
+        user_details_tb.put_item(
             Item={
                 "user_id": user_id,
                 "user_name": user_name,
@@ -225,7 +232,7 @@ def save_user_info(user_id, user_name):
 def get_conversation_history(conversation_id):
     """会話履歴を取得（個人/グループ/ルームごとに分離）"""
     try:
-        res = chat_log_tb.query(
+        res = chat_history_tb.query(
             KeyConditionExpression="conversation_id = :cid",
             ExpressionAttributeValues={":cid": conversation_id},
             Limit=20,
@@ -253,7 +260,9 @@ def save_conversation(conversation_id, actual_user_id, group_id, room_id,
                      user_name, user_message, ai_response):
     """会話を保存（グループIDを含む）"""
     try:
-        date_ms = int(datetime.utcnow().timestamp() * 1000)
+        # 日本時間でのタイムスタンプ（ミリ秒）
+        jst_now = get_jst_now()
+        date_ms = str(int(jst_now.timestamp() * 1000))
         
         item = {
             "conversation_id": conversation_id,  # PK（グループID/ルームID/ユーザーID）
@@ -263,7 +272,7 @@ def save_conversation(conversation_id, actual_user_id, group_id, room_id,
             "user_name": user_name,
             "actual_user_id": actual_user_id,  # 実際の発言者
             "tenant_id": TENANT_ID,
-            "created_at": datetime.utcnow().isoformat()
+            "created_at": jst_now.isoformat(),  # 日本時間のISO形式
         }
         
         # グループIDがある場合は追加
@@ -274,7 +283,7 @@ def save_conversation(conversation_id, actual_user_id, group_id, room_id,
         if room_id:
             item["room_id"] = room_id
             
-        chat_log_tb.put_item(Item=item)
+        chat_history_tb.put_item(Item=item)
         
     except Exception:
         logger.exception("Error saving conversation")
